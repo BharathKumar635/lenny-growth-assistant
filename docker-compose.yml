@@ -1,0 +1,15 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: lenny-postgres
+    environment:
+      POSTGRES_USER: lenny
+      POSTGRES_PASSWORD: lenny_password
+      POSTGRES_DB: lenny_db
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  postgres_data:
