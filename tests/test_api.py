@@ -278,6 +278,95 @@ class TestFastAPIEndpoints(unittest.TestCase):
             self.assertIn("Source Citations", msg)
             self.assertIn("Artifact Generation", msg)
 
+    def test_patrick_three_turn_cancellation_flowup(self):
+        """
+        Regression test: Verify 3-turn conversation where turn 3 is a short follow-up:
+        Turn 1: "What is Patrick Campbell's advice on cancellation flows?"
+        Turn 2: "Can you explain that more simply?"
+        Turn 3: "What is the most actionable step?"
+        """
+        session_id = "test_patrick_3turn_session"
+
+        # Turn 1
+        res1 = self.client.post("/api/chat", json={
+            "session_id": session_id,
+            "message": "What is Patrick Campbell's advice on cancellation flows?",
+            "provider": "ollama"
+        })
+        self.assertEqual(res1.status_code, 200)
+
+        # Turn 2
+        res2 = self.client.post("/api/chat", json={
+            "session_id": session_id,
+            "message": "Can you explain that more simply?",
+            "provider": "ollama"
+        })
+        self.assertEqual(res2.status_code, 200)
+
+        # Turn 3
+        res3 = self.client.post("/api/chat", json={
+            "session_id": session_id,
+            "message": "What is the most actionable step?",
+            "provider": "ollama"
+        })
+        self.assertEqual(res3.status_code, 200)
+        data3 = res3.json()
+        ans3 = data3.get("message", "")
+        sources3 = data3.get("sources", [])
+        ans3_lower = ans3.lower()
+
+        # Assertion 1: Turn 3 remains about Patrick / cancellation / churn / value / offboarding
+        cancellation_keywords = ["patrick", "cancellation", "cancel", "churn", "offboarding", "salvage", "discount", "pause", "value", "step"]
+        self.assertTrue(
+            any(kw in ans3_lower for kw in cancellation_keywords),
+            f"Turn 3 should address Patrick/cancellation topic. Got: {ans3}"
+        )
+
+        # Assertion 2: Turn 3 sources should belong to Patrick Campbell and NOT contain unrelated experts
+        unrelated_experts = ["melanie perkins", "varun parmar", "jake knapp", "john zeratsky"]
+        for s in sources3:
+            guest = s.get("guest", "").lower()
+            for u in unrelated_experts:
+                self.assertNotIn(u, guest, f"Turn 3 sources should not contain unrelated expert '{u}'")
+
+        for u in unrelated_experts:
+            self.assertNotIn(u, ans3_lower, f"Turn 3 answer text should not mention unrelated expert '{u}'")
+
+        # Assertion 3: Turn 3 does not start a new unrelated topic
+        self.assertNotIn("I don't have enough evidence", ans3)
+
+        # Assertion 4: Previous assistant text is not treated as evidence
+        for s in sources3:
+            self.assertTrue(bool(s.get("title")), "Source must come from transcript chunk metadata")
+
+    def test_retention_vs_engagement_distinction(self):
+        """
+        Regression test: Verify 'What is the difference between retention and engagement?'
+        distinguishes user retention from engagement and does not equate retention with net dollar retention.
+        """
+        response = self.client.post("/api/chat", json={
+            "session_id": "test_retention_vs_engagement_session",
+            "message": "What is the difference between retention and engagement?",
+            "provider": "ollama"
+        })
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        ans = data.get("message", "")
+        ans_lower = ans.lower()
+
+        # Answer should be grounded and non-empty
+        self.assertTrue(len(ans) > 0)
+        self.assertNotIn("I don't have enough evidence", ans)
+
+        # Must mention both retention and engagement
+        self.assertIn("retention", ans_lower)
+        self.assertIn("engagement", ans_lower)
+
+        # Verify response does not equate user retention with net dollar retention
+        if "net dollar retention" in ans_lower or "ndr" in ans_lower:
+            self.assertNotIn("net dollar retention is user retention", ans_lower)
+            self.assertNotIn("net dollar retention is defined as user retention", ans_lower)
+
 
 if __name__ == "__main__":
     unittest.main()

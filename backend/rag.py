@@ -21,7 +21,12 @@ CRITICAL INSTRUCTIONS:
    - Strictly attribute each claim ONLY to the specific expert who stated it in their retrieved transcript (e.g., "Sarah Tavel emphasizes...", "Patrick Campbell recommends...", "Dan Hockenmaier notes...").
    - NEVER combine one expert's idea with another expert's name (e.g., do NOT attribute early user experience to Patrick Campbell if it comes from Sarah Tavel).
    - Do NOT combine two experts' distinct ideas into a single sentence under one expert's attribution.
-5. If the retrieved evidence is insufficient to answer the question, return ONLY the exact fallback response:
+5. For conceptual comparison or definition questions (e.g. "What is the difference between retention and engagement?"):
+   - Distinguish distinct concepts precisely based strictly on the retrieved transcript evidence.
+   - Do NOT treat net dollar retention (NDR / revenue retention) as equivalent to user retention (cohort/user return over time).
+   - Clearly differentiate user retention (users returning/retained over time), net dollar retention (revenue retained/expanded), and user engagement (depth, frequency, and active feature usage).
+   - Synthesize the retrieved evidence clearly to highlight definitions and differences without conflating terms.
+6. If the retrieved evidence is insufficient to answer the question, return ONLY the exact fallback response:
    "I don't have enough evidence in the retrieved Lenny transcripts to answer that confidently."
 
 FORMATTING & GROUNDING:
@@ -147,7 +152,8 @@ def analyze_query(question: str) -> dict:
         "cancellation": ["cancellation", "cancel", "offboarding", "salvage", "churn"],
         "cancellations": ["cancellation", "cancel", "offboarding", "salvage", "churn"],
         "flows": ["flow", "flows", "funnel", "offboarding"],
-        "retention": ["retention", "retain", "retaining", "churn", "cohorts"],
+        "retention": ["retention", "retain", "retaining", "churn", "cohorts", "user retention"],
+        "engagement": ["engagement", "engage", "active", "active user", "usage", "frequency"],
         "design": ["design", "structure"],
         "org": ["org", "organization", "organizational"]
     }
@@ -257,8 +263,8 @@ def select_evidence(question: str, analysis: dict, limit: int = 3):
             ep = getattr(cand, "episode", None) or getattr(cand, "title", None) or "Unknown"
             cand_text = (getattr(cand, "content", "") or "").lower()
 
-            if "retention" in raw_query_tokens or "improve" in raw_query_tokens:
-                if not any(term in cand_text for term in ["retention", "retain", "churn", "cohort", "experience", "onboarding"]):
+            if "retention" in raw_query_tokens or "improve" in raw_query_tokens or "engagement" in raw_query_tokens:
+                if not any(term in cand_text for term in ["retention", "retain", "churn", "cohort", "experience", "onboarding", "engagement", "active", "usage"]):
                     continue
 
             if target_expert:
@@ -404,37 +410,60 @@ def format_sources(results):
     return sources
 
 
-def is_conversational_followup(question: str) -> bool:
+GENERIC_FOLLOWUP_WORDS = {
+    "step", "steps", "takeaway", "takeaways", "why", "how", "apply", "first",
+    "do", "next", "simply", "example", "recommendation", "recommendations",
+    "advice", "detail", "details", "more", "benefit", "benefits", "actionable",
+    "idea", "ideas", "point", "points", "key", "summary", "explain", "elaborate"
+}
+
+
+def is_conversational_followup(question: str, conversation_history: list[dict] = None) -> bool:
     """
     Determine if a question is a conversational follow-up relying on previous context.
     """
     if not question:
         return False
 
-    q_lower = question.lower().strip()
+    q_lower = question.strip().lower()
     words = re.findall(r"\b[a-zA-Z]{2,}\b", q_lower)
 
     # 1. Anaphoric / demonstrative pronouns & explicit reference words
     explicit_ref_words = {
         "above", "earlier", "previous", "that", "this", "it",
-        "he", "she", "they", "those", "these"
+        "he", "she", "they", "those", "these", "there", "his", "her",
+        "their", "same", "such"
     }
 
     if any(w in explicit_ref_words for w in words):
         return True
 
-    # 2. Key follow-up phrases
+    # 2. Key follow-up / continuation phrases
     followup_phrases = [
         "more simply", "simplify", "elaborate", "tell me more",
-        "explain more", "can you explain", "what about"
+        "explain more", "can you explain", "what about",
+        "actionable step", "key takeaway", "takeaway", "apply that",
+        "do first", "next step", "main takeaway", "first step"
     ]
     if any(p in q_lower for p in followup_phrases):
         return True
 
-    # 3. Short queries starting with why / how / explain (<= 4 words)
-    if len(words) <= 4:
-        if words and words[0] in {"why", "how", "explain", "elaborate"}:
-            return True
+    # 3. Short / generic queries in an active conversation without a new standalone expert or distinct domain topic
+    if conversation_history:
+        has_prev_user_msg = any(
+            msg.get("role") == "user" and msg.get("content", "").strip()
+            for msg in conversation_history
+        )
+        if has_prev_user_msg:
+            if len(words) <= 7:
+                analysis = analyze_query(question)
+                if not analysis.get("expert"):
+                    substantive_tokens = [
+                        t for t in analysis.get("raw_query_tokens", [])
+                        if t not in GENERIC_FOLLOWUP_WORDS
+                    ]
+                    if not substantive_tokens:
+                        return True
 
     return False
 
@@ -448,20 +477,30 @@ def contextualize_query(question: str, conversation_history: list[dict] = None) 
     if not conversation_history:
         return question
 
-    if not is_conversational_followup(question):
+    if not is_conversational_followup(question, conversation_history):
         return question
 
     user_msgs = [
         msg.get("content", "").strip()
-        for msg in reversed(conversation_history)
+        for msg in conversation_history
         if msg.get("role") == "user" and msg.get("content", "").strip()
     ]
 
     if not user_msgs:
         return question
 
-    last_user_msg = user_msgs[0]
-    return f"{last_user_msg} {question}"
+    anchor_msg = None
+    for idx in range(len(user_msgs) - 1, -1, -1):
+        prev_msg = user_msgs[idx]
+        history_before_prev = conversation_history[:idx * 2] if idx > 0 else []
+        if not is_conversational_followup(prev_msg, history_before_prev):
+            anchor_msg = prev_msg
+            break
+
+    if not anchor_msg:
+        anchor_msg = user_msgs[0]
+
+    return f"{anchor_msg} {question}"
 
 
 def generate_chat_response(
@@ -489,6 +528,14 @@ def generate_chat_response(
 
     t_retrieval_start = time.perf_counter()
     retrieval_query = contextualize_query(question, conversation_history)
+
+    if is_capability_question(retrieval_query):
+        return {
+            "message": CAPABILITY_RESPONSE,
+            "sources": [],
+            "provider": provider,
+        }
+
     analysis = analyze_query(retrieval_query)
     chunk_limit = 2 if analysis.get("expert") else max(1, limit)
     results, expert_has_substantive = select_evidence(retrieval_query, analysis, limit=chunk_limit)
@@ -538,6 +585,7 @@ Instructions:
 - Provide a direct answer to "QUESTION TO ANSWER" using the retrieved transcript evidence.
 - Keep each expert's points clearly separated.
 - Strictly attribute each point ONLY to the expert who stated it in the evidence (e.g., Sarah Tavel for early user experience, Patrick Campbell for cancellation flows, Dan Hockenmaier for growth models/levers).
+- For comparison questions (e.g. retention vs engagement), clearly distinguish user retention, net dollar retention (NDR), and user engagement. Do not equate net dollar retention with user retention.
 - Do not mix or swap expert names between different advice points.
 - Ensure every sentence is complete and ends with proper punctuation. Never truncate or stop mid-sentence.
 - Do not copy or repeat previous assistant responses."""
